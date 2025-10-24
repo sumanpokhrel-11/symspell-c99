@@ -74,11 +74,15 @@ symspell_destroy(dict);
 
 ## Performance
 ```
-Average lookup time:     ~30µs
+Average lookup time:     ~5µs (real-world usage)*
+Misspelling correction:  ~30µs (worst case)
+Correctly spelled:       ~0.7µs (fast path)
 Correction accuracy:     82-84%
 Dictionary size:         86,060 words
 Memory usage:            ~45MB (with deletes index)
 ```
+
+*Based on 15% real-world error rate in user-typed text (2-3% error per character × 4.7 average characters per word)
 
 Tested on Apple M4, comparable results on x86.
 
