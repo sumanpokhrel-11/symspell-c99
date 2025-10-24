@@ -197,7 +197,7 @@ This implementation is independent but follows the algorithm described in:
 - **Algorithm**: [Wolf Garbe](https://github.com/wolfgarbe) - Creator of SymSpell
 - **Implementation**: Suman Pokhrel - Pure C99 port
 
-Special thanks to Wolf Garbe for creating and open-sourcing this brilliant algorithm.
+Special thanks to [Dr. James Freeman](https://github.com/tachyon-ii) for his mentorship and guidance on this project.
 
 ---
 
