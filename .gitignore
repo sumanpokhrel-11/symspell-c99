@@ -1,0 +1,22 @@
+# Compiled binaries
+test_symspell
+benchmark_symspell
+*.o
+*.a
+*.so
+*.dylib
+
+# Build artifacts
+build/
+*.dSYM/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Test outputs
+*.log
+core
