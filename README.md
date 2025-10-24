@@ -20,7 +20,7 @@ Original algorithm by [Wolf Garbe](https://github.com/wolfgarbe/SymSpell)
 
 ## Features
 
-- ⚡ **Fast**: ~30µs average lookup time
+- ⚡ **Fast**: Average lookup time ~5µs (real-world usage)*
 - 🎯 **Accurate**: 82-84% correction rate on standard test sets
 - 🧹 **Clean**: Zero compiler warnings, ~700 lines of well-structured code
 - 🌐 **Portable**: POSIX-compliant, works on any Unix system
