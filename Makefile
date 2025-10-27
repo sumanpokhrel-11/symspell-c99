@@ -2,15 +2,19 @@
 CC = gcc
 CFLAGS = -std=c99 -Wall -Wextra -O2 -Iinclude
 
+# Add -lm to LDFLAGS
+LDFLAGS = -lm
+
+
 .PHONY: all test benchmark clean help
 
 all: test_symspell benchmark_symspell
 
 test_symspell: test/test_symspell.c src/symspell.c
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 benchmark_symspell: test/benchmark_symspell.c src/symspell.c
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 test: test_symspell
 	./test_symspell dictionaries/dictionary.txt
