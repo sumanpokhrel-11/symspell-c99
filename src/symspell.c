@@ -661,7 +661,6 @@ bool symspell_load_dictionary(
     return true;
 }
 
-#ifdef DO_SORT
 /* Comparison function for sorting suggestions */
 static int compare_suggestions(const void* a, const void* b) {
     const symspell_suggestion_t* sa = a;
@@ -670,12 +669,14 @@ static int compare_suggestions(const void* a, const void* b) {
     if (sa->frequency != sb->frequency) return (sa->frequency > sb->frequency) ? -1 : 1;
     return strcmp(sa->term, sb->term);
 }
-#endif
 
-/* Lookup suggestions */
 int symspell_lookup(
-    const symspell_dict_t* dict, const char* term, int max_edit_distance_lookup,
-    symspell_suggestion_t* suggestions, int max_suggestions
+    const symspell_dict_t* dict,
+    const char* term,
+    symspell_verbosity_t verbosity,
+    int max_edit_distance,
+    symspell_suggestion_t* suggestions,
+    int max_suggestions
 ) {
     if (!dict || !term || !suggestions || max_suggestions <= 0) return 0;
 
@@ -703,26 +704,27 @@ int symspell_lookup(
             strncpy(suggestions[0].term, query, SYMSPELL_MAX_TERM_LENGTH - 1);
             suggestions[0].term[SYMSPELL_MAX_TERM_LENGTH - 1] = '\0';
             pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
-            return 1;
+            return 1;  // Exact match - always return 1 regardless of verbosity
         }
     }
     
     /* SLOW PATH: Not found - do full SymSpell search */
-    int max_edit_distance = (max_edit_distance_lookup < dict->max_edit_distance) 
-                            ? max_edit_distance_lookup : dict->max_edit_distance;
+    int max_edit_distance_search = (max_edit_distance < dict->max_edit_distance) 
+                                   ? max_edit_distance : dict->max_edit_distance;
     
     if (strlen(query) <= 4) {
-        max_edit_distance = 1;
+        max_edit_distance_search = 1;
     }
     
     symspell_suggestion_t* candidates = dict->candidate_buffer;
     int candidate_count = 0;
     
     size_t delete_count = _generate_all_deletes_reuse(
-        query, max_edit_distance, dict->prefix_length,
+        query, max_edit_distance_search, dict->prefix_length,
         dict->delete_work_buffer, dict->delete_buffer_capacity
     );
     
+    // Collect all candidates
     for (size_t d = 0; d < delete_count; d++) {
         uint64_t hash = xxh3(dict->delete_work_buffer[d], strlen(dict->delete_work_buffer[d]));
         for (size_t probe = 0; probe < dict->table_size; probe++) {
@@ -732,8 +734,8 @@ int symspell_lookup(
             if (strcmp(dict->table[idx]->delete_str, dict->delete_work_buffer[d]) == 0) {
                 delete_entry_t* entry = dict->table[idx];
                 for (size_t j = 0; j < entry->count && candidate_count < MAX_CANDIDATES_PER_LOOKUP; j++) {
-                    int dist = edit_distance(query, entry->words[j], max_edit_distance);
-                    if (dist <= max_edit_distance) {
+                    int dist = edit_distance(query, entry->words[j], max_edit_distance_search);
+                    if (dist <= max_edit_distance_search) {
                         bool found = false;
                         for (int c = 0; c < candidate_count; c++) {
                             if (strcmp(candidates[c].term, entry->words[j]) == 0) {
@@ -754,48 +756,75 @@ int symspell_lookup(
         }
     }
     
+    // Cleanup delete buffer
     for (size_t d = 0; d < delete_count; d++) {
         free(dict->delete_work_buffer[d]);
         dict->delete_work_buffer[d] = NULL;
     }
 
-#ifdef DO_SORT
-    if (candidate_count > 0) {
-        qsort(candidates, candidate_count, sizeof(symspell_suggestion_t), compare_suggestions);
+    if (candidate_count == 0) {
+        pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
+        return 0;
     }
     
-    int result_count = (candidate_count < max_suggestions) ? candidate_count : max_suggestions;
-    for (int i = 0; i < result_count; i++) {
-        suggestions[i] = candidates[i];
+    // Sort all candidates by distance, then frequency
+    qsort(candidates, candidate_count, sizeof(symspell_suggestion_t), compare_suggestions);
+    
+    // Apply verbosity filtering
+    int result_count = 0;
+    
+    switch (verbosity) {
+        case SYMSPELL_VERBOSITY_TOP:
+            // Return only the single best suggestion
+            suggestions[0] = candidates[0];
+            uint64_t best_hash = xxh3(candidates[0].term, strlen(candidates[0].term));
+            suggestions[0].probability = symspell_get_probability(dict, best_hash);
+            suggestions[0].iwf = calculate_iwf(suggestions[0].probability);
+            result_count = 1;
+            break;
+            
+        case SYMSPELL_VERBOSITY_CLOSEST:
+            // Return all suggestions at minimum edit distance
+            {
+                int min_distance = candidates[0].distance;
+                for (int i = 0; i < candidate_count && result_count < max_suggestions; i++) {
+                    if (candidates[i].distance == min_distance) {
+                        suggestions[result_count] = candidates[i];
+                        uint64_t hash = xxh3(candidates[i].term, strlen(candidates[i].term));
+                        suggestions[result_count].probability = symspell_get_probability(dict, hash);
+                        suggestions[result_count].iwf = calculate_iwf(suggestions[result_count].probability);
+                        result_count++;
+                    } else {
+                        break;  // Stop when distance increases
+                    }
+                }
+            }
+            break;
+            
+        case SYMSPELL_VERBOSITY_ALL:
+            // Return all suggestions up to max_suggestions
+            result_count = (candidate_count < max_suggestions) ? candidate_count : max_suggestions;
+            for (int i = 0; i < result_count; i++) {
+                suggestions[i] = candidates[i];
+                uint64_t hash = xxh3(candidates[i].term, strlen(candidates[i].term));
+                suggestions[i].probability = symspell_get_probability(dict, hash);
+                suggestions[i].iwf = calculate_iwf(suggestions[i].probability);
+            }
+            break;
+            
+        default:
+            // Fallback to TOP
+            suggestions[0] = candidates[0];
+            uint64_t hash = xxh3(candidates[0].term, strlen(candidates[0].term));
+            suggestions[0].probability = symspell_get_probability(dict, hash);
+            suggestions[0].iwf = calculate_iwf(suggestions[0].probability);
+            result_count = 1;
+            break;
     }
+    
     pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
     return result_count;
-#else
-    if (candidate_count > 0) {
-        symspell_suggestion_t best_suggestion = candidates[0];
-        for (int i = 1; i < candidate_count; i++) {
-            if (candidates[i].distance < best_suggestion.distance) {
-                best_suggestion = candidates[i];
-            } else if (candidates[i].distance == best_suggestion.distance &&
-                       candidates[i].frequency > best_suggestion.frequency) {
-                best_suggestion = candidates[i];
-            }
-        }
-        
-        uint64_t best_hash = xxh3(best_suggestion.term, strlen(best_suggestion.term));
-        float probability = symspell_get_probability(dict, best_hash);
-        best_suggestion.probability = probability;
-        best_suggestion.iwf = calculate_iwf(probability);
-
-        suggestions[0] = best_suggestion;
-        pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
-        return 1;
-    }
-    pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
-    return 0;
-#endif
 }
-
 /* Get probability for a word hash */
 float symspell_get_probability(const symspell_dict_t* dict, uint64_t word_hash) {
     if (!dict || !dict->exact_table) return 0.0f;
