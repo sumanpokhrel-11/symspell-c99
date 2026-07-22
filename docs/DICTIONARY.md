@@ -513,7 +513,7 @@ symspell_load_dictionary(dict, "dictionaries/dictionary.txt", 0, 1);
 
 **Why:**
 - Optimized for spell-checking accuracy
-- Fast (~950ms load, ~30µs lookup)
+- Fast (~500ms load, ~3µs lookup)
 - Balanced across domains
 - Good enough for general text
 
