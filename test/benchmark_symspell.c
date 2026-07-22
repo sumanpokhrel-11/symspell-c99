@@ -99,7 +99,7 @@ int main(int argc, char* argv[]) {
         symspell_suggestion_t suggestions[5];
         
         double start_lookup = get_time_ms();
-        int count = symspell_lookup(dict, misspelled, SYMSPELL_VERBOSITY_TOP, 2, suggestions, 5);
+        int count = symspell_lookup(dict, misspelled, 2, suggestions, 5);
         double end_lookup = get_time_ms();
         
         total_lookup_time_ms += (end_lookup - start_lookup);

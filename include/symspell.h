@@ -15,10 +15,6 @@
 #ifndef SYMSPELL_H
 #define SYMSPELL_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -69,6 +65,25 @@ bool symspell_load_dictionary(
 );
 
 /*
+ * Find spelling suggestions for a term
+ * 
+ * dict: Dictionary handle
+ * term: Input term (will be lowercased internally)
+ * max_edit_distance: Maximum edit distance to search
+ * suggestions: Output array for suggestions
+ * max_suggestions: Maximum number of suggestions to return
+ * 
+ * Returns: Number of suggestions found
+ */
+int symspell_lookup(
+    const symspell_dict_t* dict,
+    const char* term,
+    int max_edit_distance,
+    symspell_suggestion_t* suggestions,
+    int max_suggestions
+);
+
+/*
  * Free dictionary
  */
 void symspell_destroy(symspell_dict_t* dict);
@@ -94,54 +109,5 @@ float symspell_get_iwf(
     const symspell_dict_t* dict, 
     const char* word
 );
-
-/**
- * Verbosity levels for lookup results
- */
-typedef enum {
-    /**
-     * Top suggestion only - for auto-correct use cases
-     * Returns the single best match by edit distance, then frequency
-     */
-    SYMSPELL_VERBOSITY_TOP = 0,
-    
-    /**
-     * All suggestions at closest edit distance - for UI with alternatives
-     * Returns all matches at minimum edit distance, sorted by frequency
-     */
-    SYMSPELL_VERBOSITY_CLOSEST = 1,
-    
-    /**
-     * All suggestions within max edit distance - for comprehensive results
-     * Returns all matches up to max_edit_distance, sorted by distance then frequency
-     */
-    SYMSPELL_VERBOSITY_ALL = 2
-} symspell_verbosity_t;
-
-
-/**
- * Lookup suggestions with verbosity control
- * 
- * @param dict Dictionary to search
- * @param term Input word to correct
- * @param verbosity Control how many suggestions to return
- * @param max_edit_distance Maximum edit distance to consider
- * @param suggestions Output array for suggestions
- * @param max_suggestions Maximum size of suggestions array
- * @return Number of suggestions found (0 if none)
- */
-int symspell_lookup(
-    const symspell_dict_t* dict,
-    const char* term,
-    symspell_verbosity_t verbosity,
-    int max_edit_distance,
-    symspell_suggestion_t* suggestions,
-    int max_suggestions
-);
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* SYMSPELL_H */

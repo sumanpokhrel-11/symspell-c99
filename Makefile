@@ -1,6 +1,9 @@
 # SymSpell C99 - Simple Makefile
 CC = gcc
 CFLAGS = -std=c99 -Wall -Wextra -O2 -Iinclude
+# test_symspell wants the full sorted candidate list (interactive/correctness use);
+# benchmark_symspell intentionally omits -DDO_SORT to measure the fast single-best-match path.
+CFLAGS_TEST = $(CFLAGS) -DDO_SORT
 
 # Add -lm to LDFLAGS
 LDFLAGS = -lm
@@ -11,7 +14,7 @@ LDFLAGS = -lm
 all: test_symspell benchmark_symspell
 
 test_symspell: test/test_symspell.c src/symspell.c
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS_TEST) $^ -o $@ $(LDFLAGS)
 
 benchmark_symspell: test/benchmark_symspell.c src/symspell.c
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)

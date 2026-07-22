@@ -35,7 +35,7 @@ void run_test_suite(symspell_dict_t* dict) {
         bool test_passed = true;
         
         // Test TOP verbosity
-        int count = symspell_lookup(dict, test->input, SYMSPELL_VERBOSITY_TOP, 2, suggestions, 10);
+        int count = symspell_lookup(dict, test->input, 2, suggestions, 10);
         
         printf("Test %d: '%s'\n", i+1, test->input);
         printf("  Expected: '%s' (distance=%d)\n", test->expected_top, test->expected_distance);
@@ -60,7 +60,7 @@ void run_test_suite(symspell_dict_t* dict) {
         }
         
         // Test CLOSEST verbosity
-        count = symspell_lookup(dict, test->input, SYMSPELL_VERBOSITY_CLOSEST, 2, suggestions, 10);
+        count = symspell_lookup(dict, test->input, 2, suggestions, 10);
         printf("  CLOSEST mode: %d suggestions", count);
         
         if (count >= test->min_closest_count) {

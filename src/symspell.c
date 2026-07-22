@@ -97,6 +97,48 @@ typedef struct {
     size_t table_size;
 } exact_match_table_t;
 
+/* --- Reusable lookup scratch types (added) ------------------------------------------- */
+typedef struct {
+    char str[SYMSPELL_MAX_TERM_LENGTH];
+    int  distance;
+} queue_item_t;
+
+/* Open-addressed set keyed on a 64-bit hash, cleared in O(1) via a generation stamp.
+ * Replaces the per-lookup ht_create()/ht_destroy() churn. Collision-safe: on a hash
+ * match the stored string pointer is strcmp-verified. */
+typedef struct {
+    uint64_t*    key;
+    const char** str;
+    uint32_t*    stamp;
+    size_t       cap;   /* power of two */
+    size_t       mask;
+    uint32_t     gen;
+} genset_t;
+
+static bool genset_init(genset_t* set, size_t cap_pow2) {
+    set->cap = cap_pow2; set->mask = cap_pow2 - 1; set->gen = 0;
+    set->key   = malloc(cap_pow2 * sizeof(uint64_t));
+    set->str   = malloc(cap_pow2 * sizeof(const char*));
+    set->stamp = calloc(cap_pow2, sizeof(uint32_t));
+    return set->key && set->str && set->stamp;
+}
+static inline void genset_reset(genset_t* set) {
+    if (++set->gen == 0) { memset(set->stamp, 0, set->cap * sizeof(uint32_t)); set->gen = 1; }
+}
+/* Returns true if (h,str) already present this generation; else inserts and returns false. */
+static inline bool genset_seen_or_add(genset_t* set, uint64_t h, const char* str) {
+    size_t idx = (size_t)h & set->mask;
+    for (;;) {
+        if (set->stamp[idx] != set->gen) {
+            set->stamp[idx] = set->gen; set->key[idx] = h; set->str[idx] = str;
+            return false;
+        }
+        if (set->key[idx] == h && strcmp(set->str[idx], str) == 0) return true;
+        idx = (idx + 1) & set->mask;
+    }
+}
+static void genset_free(genset_t* set) { free(set->key); free(set->str); free(set->stamp); }
+
 /* SymSpell dictionary structure with pre-allocated work buffers */
 struct symspell_dict {
     delete_entry_t** table;           /* Hash table for deletes */
@@ -116,7 +158,13 @@ struct symspell_dict {
     /* Reusable work buffers for lookup path */
     char** delete_work_buffer;
     size_t delete_buffer_capacity;
-    symspell_suggestion_t* candidate_buffer;    
+    symspell_suggestion_t* candidate_buffer;
+
+    /* reusable lookup scratch (added) */
+    queue_item_t* delete_queue;
+    char*         delete_pool;
+    genset_t      delete_seen;
+    genset_t      cand_seen;    
 };
 
 /* --- Arena Allocator Functions --- */
@@ -157,14 +205,7 @@ static const char* arena_strdup(arena_t* arena, const char* s) {
     return new_str;
 }
 
-/* C99-compatible strdup replacement (uses malloc, caller must free) */
-static char* str_dup(const char* s) {
-    size_t len = strlen(s) + 1;
-    char* new_str = malloc(len);
-    if (!new_str) return NULL;
-    memcpy(new_str, s, len);
-    return new_str;
-}
+/* str_dup removed: delete generation now writes into the reusable delete_pool */
 
 /* Convert string to lowercase in-place */
 static void str_tolower(char* str) {
@@ -182,59 +223,117 @@ float calculate_iwf(const float probability) {
     }
 }
 
-/* Calculate edit distance (Damerau-Levenshtein) */
-static int edit_distance(const char* s1, const char* s2, int max_distance) {
-    int len1 = strlen(s1);
-    int len2 = strlen(s2);
-    
-    if (len1 >= SYMSPELL_MAX_TERM_LENGTH || len2 >= SYMSPELL_MAX_TERM_LENGTH) {
-        return max_distance + 1;
+/* delete_in_suggestion_prefix - is `del` a subsequence of the first prefix_length chars of
+ * `sug`? Faithful port of SymSpell.DeleteInSuggestionPrefix. */
+static bool delete_in_suggestion_prefix(const char* del, int del_len,
+                                        const char* sug, int sug_len, int prefix_length) {
+    if (del_len == 0) return true;
+    if (prefix_length < sug_len) sug_len = prefix_length;
+    int j = 0;
+    for (int i = 0; i < del_len; i++) {
+        char dch = del[i];
+        while (j < sug_len && dch != sug[j]) j++;
+        if (j++ == sug_len) return false;
     }
-
-    if (abs(len1 - len2) > max_distance) {
-        return max_distance + 1;
-    }
-    
-    int d[len1 + 1][len2 + 1];
-    
-    for (int i = 0; i <= len1; i++) d[i][0] = i;
-    for (int j = 0; j <= len2; j++) d[0][j] = j;
-    
-    for (int i = 1; i <= len1; i++) {
-        for (int j = 1; j <= len2; j++) {
-            int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
-            
-            int delete_cost = d[i-1][j] + 1;
-            int insert_cost = d[i][j-1] + 1;
-            int subst_cost = d[i-1][j-1] + cost;
-            
-            d[i][j] = (delete_cost < insert_cost) ? delete_cost : insert_cost;
-            if (subst_cost < d[i][j]) d[i][j] = subst_cost;
-            
-            if (i > 1 && j > 1 && s1[i-1] == s2[j-2] && s1[i-2] == s2[j-1]) {
-                int trans_cost = d[i-2][j-2] + 1;
-                if (trans_cost < d[i][j]) d[i][j] = trans_cost;
-            }
-        }
-        
-        int min_in_row = d[i][0];
-        for (int j = 1; j <= len2; j++) {
-            if (d[i][j] < min_in_row) min_in_row = d[i][j];
-        }
-        if (min_in_row > max_distance) {
-            return max_distance + 1;
-        }
-    }
-    
-    return d[len1][len2];
+    return true;
 }
 
+/* damerau_osa - Damerau-Levenshtein optimal string alignment distance, bounded by max_distance.
+ * Faithful C port of SoftWx.Match DamerauOSA.Distance(s1,s2,maxDistance): shorter string first,
+ * common prefix/suffix trimmed, then a banded (or, when it fits, full) single-vector DP.
+ * Returns the distance, or max_distance+1 if it exceeds max_distance. */
+static int damerau_osa(const char* s1, int l1, const char* s2, int l2, int max_distance) {
+    if (l1 > l2) { const char* ts = s1; s1 = s2; s2 = ts; int tl = l1; l1 = l2; l2 = tl; }
+    if (l2 - l1 > max_distance) return max_distance + 1;
+
+    int len1 = l1, len2 = l2;
+    while (len1 != 0 && s1[len1 - 1] == s2[len2 - 1]) { len1--; len2--; }
+    int start = 0;
+    while (start != len1 && s1[start] == s2[start]) start++;
+    if (start != 0) { len1 -= start; len2 -= start; }
+    if (len1 == 0) return (len2 <= max_distance) ? len2 : (max_distance + 1);
+
+    int c1[SYMSPELL_MAX_TERM_LENGTH];
+    int pc1[SYMSPELL_MAX_TERM_LENGTH];
+    memset(pc1, 0, (size_t)len2 * sizeof(int));
+    int i, j, currentCost = 0;
+
+    if (max_distance < len2) {
+        for (j = 0; j < max_distance; j++) c1[j] = j + 1;
+        for (; j < len2;) c1[j++] = max_distance + 1;
+        int lenDiff = len2 - len1;
+        int jStartOffset = max_distance - lenDiff;
+        int jStart = 0, jEnd = max_distance;
+        char char1 = ' ';
+        for (i = 0; i < len1; ++i) {
+            char prevChar1 = char1;
+            char1 = s1[start + i];
+            char char2 = ' ';
+            int leftCharCost = i, aboveCharCost = i;
+            int nextTransCost = 0;
+            jStart += (i > jStartOffset) ? 1 : 0;
+            jEnd += (jEnd < len2) ? 1 : 0;
+            for (j = jStart; j < jEnd; ++j) {
+                int thisTransCost = nextTransCost;
+                nextTransCost = pc1[j];
+                pc1[j] = currentCost = leftCharCost;
+                leftCharCost = c1[j];
+                char prevChar2 = char2;
+                char2 = s2[start + j];
+                if (char1 != char2) {
+                    if (aboveCharCost < currentCost) currentCost = aboveCharCost;
+                    if (leftCharCost < currentCost) currentCost = leftCharCost;
+                    ++currentCost;
+                    if ((i != 0) && (j != 0)
+                        && (char1 == prevChar2) && (prevChar1 == char2)
+                        && (thisTransCost + 1 < currentCost)) {
+                        currentCost = thisTransCost + 1;
+                    }
+                }
+                c1[j] = aboveCharCost = currentCost;
+            }
+            if (c1[i + lenDiff] > max_distance) return max_distance + 1;
+        }
+        return (currentCost <= max_distance) ? currentCost : (max_distance + 1);
+    } else {
+        for (j = 0; j < len2; j++) c1[j] = j + 1;
+        char char1 = ' ';
+        for (i = 0; i < len1; ++i) {
+            char prevChar1 = char1;
+            char1 = s1[start + i];
+            char char2 = ' ';
+            int leftCharCost = i, aboveCharCost = i;
+            int nextTransCost = 0;
+            for (j = 0; j < len2; ++j) {
+                int thisTransCost = nextTransCost;
+                nextTransCost = pc1[j];
+                pc1[j] = currentCost = leftCharCost;
+                leftCharCost = c1[j];
+                char prevChar2 = char2;
+                char2 = s2[start + j];
+                if (char1 != char2) {
+                    if (aboveCharCost < currentCost) currentCost = aboveCharCost;
+                    if (leftCharCost < currentCost) currentCost = leftCharCost;
+                    ++currentCost;
+                    if ((i != 0) && (j != 0)
+                        && (char1 == prevChar2) && (prevChar1 == char2)
+                        && (thisTransCost + 1 < currentCost)) {
+                        currentCost = thisTransCost + 1;
+                    }
+                }
+                c1[j] = aboveCharCost = currentCost;
+            }
+        }
+        return currentCost;
+    }
+}
 /*
  * Internal shared function to generate all unique deletes for a term
  * Uses caller-provided buffer to avoid malloc/free in hot paths
  * Now uses portable hash table instead of hsearch_r
  */
 static size_t _generate_all_deletes_reuse(
+    symspell_dict_t* dict,
     const char* word,
     int max_distance,
     int prefix_length,
@@ -246,78 +345,43 @@ static size_t _generate_all_deletes_reuse(
 
     char prefix[SYMSPELL_MAX_TERM_LENGTH];
     snprintf(prefix, sizeof(prefix), "%.*s",
-             (word_len > prefix_length) ? prefix_length : word_len,
-             word);
-
+             (word_len > prefix_length) ? prefix_length : word_len, word);
     int prefix_len = strlen(prefix);
 
-    typedef struct {
-        char str[SYMSPELL_MAX_TERM_LENGTH];
-        int distance;
-    } queue_item_t;
-
-    queue_item_t* queue = malloc(DELETE_QUEUE_CAPACITY * sizeof(queue_item_t));
-    if (!queue) {
-        fprintf(stderr, "Error: Failed to allocate delete queue\n");
-        return 0;
-    }
+    queue_item_t* queue = dict->delete_queue;   /* reused, no per-lookup malloc */
+    genset_t* seen = &dict->delete_seen;
+    genset_reset(seen);                          /* O(1) clear, no ht_create/destroy */
 
     size_t delete_count = 0;
 
-    /* Create portable hash table for uniqueness checking */
-    HT_TABLE* uniq_set = ht_create(max_deletes * 2);
-    if (!uniq_set) {
-        fprintf(stderr, "Error: Failed to create uniqueness hash table\n");
-        free(queue);
-        return 0;
-    }
-
-    /* Add "" (empty string) if required */
+    /* Empty string (only if within max_distance of the prefix). */
     if (prefix_len <= max_distance && delete_count < max_deletes) {
-        HT_ENTRY find = {"", NULL};
-        HT_ENTRY* result = ht_search(uniq_set, find, HT_FIND);
-        
-        if (!result) {
-            deletes_out[delete_count] = str_dup("");
-            if (!deletes_out[delete_count]) {
-                fprintf(stderr, "Error: str_dup failed for empty string\n");
-            } else {
-                HT_ENTRY item = {deletes_out[delete_count], (void*)1};
-                ht_search(uniq_set, item, HT_ENTER);
-                delete_count++;
-            }
-        }
+        char* slot = deletes_out[delete_count];
+        slot[0] = '\0';
+        if (!genset_seen_or_add(seen, xxh3("", 0), slot)) delete_count++;
     }
 
-    /* Add prefix */
+    /* The prefix itself. */
     if (delete_count < max_deletes) {
-        HT_ENTRY find = {prefix, NULL};
-        HT_ENTRY* result = ht_search(uniq_set, find, HT_FIND);
-        
-        if (!result) {
-            deletes_out[delete_count] = str_dup(prefix);
-            if (!deletes_out[delete_count]) {
-                fprintf(stderr, "Error: str_dup failed for prefix\n");
-            } else {
-                HT_ENTRY item = {deletes_out[delete_count], (void*)1};
-                ht_search(uniq_set, item, HT_ENTER);
-                delete_count++;
-            }
-        }
+        char* slot = deletes_out[delete_count];
+        memcpy(slot, prefix, (size_t)prefix_len + 1);
+        if (!genset_seen_or_add(seen, xxh3(slot, (size_t)prefix_len), slot)) delete_count++;
     }
 
-    snprintf(queue[0].str, SYMSPELL_MAX_TERM_LENGTH, "%s", prefix);
-    queue[0].distance = 0;
-    int queue_start = 0;
-    int queue_end = 1;
+    /* BFS over deletions of the prefix, capped at max_distance, deduped via the stamped set.
+     * Each unique delete is written straight into the caller's pooled slot (no str_dup) and
+     * enqueued once for the next level. */
+    int queue_start = 0, queue_end = 0;
+    memcpy(queue[queue_end].str, prefix, (size_t)prefix_len + 1);
+    queue[queue_end].distance = 0;
+    queue_end++;
 
     while (queue_start < queue_end && delete_count < max_deletes) {
         queue_item_t current = queue[queue_start++];
-        int cur_len = strlen(current.str);
-
+        int cur_len = (int)strlen(current.str);
         if (current.distance >= max_distance || cur_len <= 1) continue;
 
-        for (int i = 0; i < cur_len; i++) {
+        for (int i = 0; i < cur_len && delete_count < max_deletes; i++) {
             char deleted[SYMSPELL_MAX_TERM_LENGTH];
             int k = 0;
             for (int j = 0; j < cur_len; j++) {
@@ -325,52 +389,22 @@ static size_t _generate_all_deletes_reuse(
             }
             deleted[k] = '\0';
 
-            /* Check if we've seen this delete before */
-            HT_ENTRY find = {deleted, NULL};
-            HT_ENTRY* result = ht_search(uniq_set, find, HT_FIND);
-            
-            if (!result) {
-                if (delete_count < max_deletes) {
-                    deletes_out[delete_count] = str_dup(deleted);
-                    if (!deletes_out[delete_count]) {
-                        fprintf(stderr, "Error: str_dup failed for delete\n");
-                        continue;
-                    }
-
-                    HT_ENTRY item = {deletes_out[delete_count], (void*)1};
-                    if (!ht_search(uniq_set, item, HT_ENTER)) {
-                        fprintf(stderr, "Error: Failed to add to hash table\n");
-                        free(deletes_out[delete_count]);
-                        deletes_out[delete_count] = NULL;
-                    } else {
-                        delete_count++;
-                    }
-                }
-            }
-
-            /* Add to queue for next level processing */
-            if (queue_end < DELETE_QUEUE_CAPACITY) {
-                bool in_queue = false;
-                for (int q = queue_start; q < queue_end; q++) {
-                    if (strcmp(queue[q].str, deleted) == 0) {
-                        in_queue = true;
-                        break;
-                    }
-                }
-                if (!in_queue) {
-                    snprintf(queue[queue_end].str, SYMSPELL_MAX_TERM_LENGTH, "%s", deleted);
+            uint64_t h = xxh3(deleted, (size_t)k);
+            char* slot = deletes_out[delete_count];
+            memcpy(slot, deleted, (size_t)k + 1);
+            if (!genset_seen_or_add(seen, h, slot)) {
+                delete_count++;                              /* newly generated delete */
+                if (queue_end < DELETE_QUEUE_CAPACITY) {     /* schedule next level */
+                    memcpy(queue[queue_end].str, deleted, (size_t)k + 1);
                     queue[queue_end].distance = current.distance + 1;
                     queue_end++;
                 }
             }
+            /* already seen: pooled slot is overwritten on the next iteration */
         }
     }
-
-    ht_destroy(uniq_set);
-    free(queue);
     return delete_count;
 }
-
 /* Add word to delete entry */
 static bool add_to_entry(symspell_dict_t* dict, delete_entry_t* entry, const char* word, uint64_t freq) {
     for (size_t i = 0; i < entry->count; i++) {
@@ -459,14 +493,12 @@ static bool add_delete(symspell_dict_t* dict, const char* delete_str,
 /* Generate all deletes for a word and add to dictionary */
 static bool generate_deletes(symspell_dict_t* dict, const char* word, uint64_t freq) {
     size_t delete_count = _generate_all_deletes_reuse(
-        word, dict->max_edit_distance, dict->prefix_length,
+        dict, word, dict->max_edit_distance, dict->prefix_length,
         dict->delete_work_buffer, dict->delete_buffer_capacity
     );
 
     for (size_t i = 0; i < delete_count; i++) {
         add_delete(dict, dict->delete_work_buffer[i], word, freq);
-        free(dict->delete_work_buffer[i]);
-        dict->delete_work_buffer[i] = NULL;
     }
     return true;
 }
@@ -558,6 +590,23 @@ symspell_dict_t* symspell_create(int max_edit_distance, int prefix_length) {
     dict->candidate_buffer = malloc(MAX_CANDIDATES_PER_LOOKUP * sizeof(symspell_suggestion_t));
     if (!dict->candidate_buffer) {
         perror("symspell_create failed: malloc dict->candidate_buffer");
+        symspell_destroy(dict);
+        return NULL;
+    }
+
+    /* Reusable lookup scratch (added): eliminates per-lookup malloc / ht_create / str_dup. */
+    dict->delete_queue = malloc((size_t)DELETE_QUEUE_CAPACITY * sizeof(queue_item_t));
+    dict->delete_pool  = malloc((size_t)dict->delete_buffer_capacity * SYMSPELL_MAX_TERM_LENGTH);
+    if (!dict->delete_queue || !dict->delete_pool) {
+        perror("symspell_create failed: malloc lookup scratch");
+        symspell_destroy(dict);
+        return NULL;
+    }
+    for (size_t i = 0; i < dict->delete_buffer_capacity; i++) {
+        dict->delete_work_buffer[i] = dict->delete_pool + i * SYMSPELL_MAX_TERM_LENGTH;
+    }
+    if (!genset_init(&dict->delete_seen, 32768) || !genset_init(&dict->cand_seen, 32768)) {
+        perror("symspell_create failed: genset_init");
         symspell_destroy(dict);
         return NULL;
     }
@@ -661,6 +710,7 @@ bool symspell_load_dictionary(
     return true;
 }
 
+#ifdef DO_SORT
 /* Comparison function for sorting suggestions */
 static int compare_suggestions(const void* a, const void* b) {
     const symspell_suggestion_t* sa = a;
@@ -669,14 +719,12 @@ static int compare_suggestions(const void* a, const void* b) {
     if (sa->frequency != sb->frequency) return (sa->frequency > sb->frequency) ? -1 : 1;
     return strcmp(sa->term, sb->term);
 }
+#endif
 
+/* Lookup suggestions */
 int symspell_lookup(
-    const symspell_dict_t* dict,
-    const char* term,
-    symspell_verbosity_t verbosity,
-    int max_edit_distance,
-    symspell_suggestion_t* suggestions,
-    int max_suggestions
+    const symspell_dict_t* dict, const char* term, int max_edit_distance_lookup,
+    symspell_suggestion_t* suggestions, int max_suggestions
 ) {
     if (!dict || !term || !suggestions || max_suggestions <= 0) return 0;
 
@@ -704,127 +752,151 @@ int symspell_lookup(
             strncpy(suggestions[0].term, query, SYMSPELL_MAX_TERM_LENGTH - 1);
             suggestions[0].term[SYMSPELL_MAX_TERM_LENGTH - 1] = '\0';
             pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
-            return 1;  // Exact match - always return 1 regardless of verbosity
+            return 1;
         }
     }
     
     /* SLOW PATH: Not found - do full SymSpell search */
-    int max_edit_distance_search = (max_edit_distance < dict->max_edit_distance) 
-                                   ? max_edit_distance : dict->max_edit_distance;
+    int max_edit_distance = (max_edit_distance_lookup < dict->max_edit_distance) 
+                            ? max_edit_distance_lookup : dict->max_edit_distance;
     
-    if (strlen(query) <= 4) {
-        max_edit_distance_search = 1;
-    }
     
-    symspell_suggestion_t* candidates = dict->candidate_buffer;
+    /* ---- Faithful port of SymSpell (C#) Lookup, Verbosity.Closest ---- */
+    symspell_suggestion_t* candidates = dict->candidate_buffer;   /* result set (smallest distance) */
     int candidate_count = 0;
-    
-    size_t delete_count = _generate_all_deletes_reuse(
-        query, max_edit_distance_search, dict->prefix_length,
-        dict->delete_work_buffer, dict->delete_buffer_capacity
-    );
-    
-    // Collect all candidates
-    for (size_t d = 0; d < delete_count; d++) {
-        uint64_t hash = xxh3(dict->delete_work_buffer[d], strlen(dict->delete_work_buffer[d]));
+
+    int input_len = (int)strlen(query);
+    int max2 = max_edit_distance;                    /* shrinks as closer suggestions are found */
+    int input_prefix_len = input_len;
+
+    char** cand_list = dict->delete_work_buffer;     /* pooled slots reused as the delete-candidate list */
+    int cand_list_count = 0;
+
+    genset_reset((genset_t*)&dict->delete_seen);     /* hashset1: deletes already generated */
+    genset_reset((genset_t*)&dict->cand_seen);       /* hashset2: suggestions already considered */
+    genset_seen_or_add((genset_t*)&dict->cand_seen, xxh3(query, (size_t)input_len), query);
+
+    if (input_prefix_len > dict->prefix_length) {
+        input_prefix_len = dict->prefix_length;
+        memcpy(cand_list[0], query, (size_t)input_prefix_len);
+        cand_list[0][input_prefix_len] = '\0';
+    } else {
+        memcpy(cand_list[0], query, (size_t)input_len + 1);
+    }
+    cand_list_count = 1;
+
+    for (int cptr = 0; cptr < cand_list_count; cptr++) {
+        const char* candidate = cand_list[cptr];
+        int candidate_len = (int)strlen(candidate);
+        int length_diff = input_prefix_len - candidate_len;
+
+        if (length_diff > max2) break;               /* candidates ordered by delete distance */
+
+        uint64_t chash = xxh3(candidate, (size_t)candidate_len);
         for (size_t probe = 0; probe < dict->table_size; probe++) {
-            size_t idx = (hash + probe) % dict->table_size;
+            size_t idx = (chash + probe) % dict->table_size;
             if (!dict->table[idx]) break;
-            
-            if (strcmp(dict->table[idx]->delete_str, dict->delete_work_buffer[d]) == 0) {
-                delete_entry_t* entry = dict->table[idx];
-                for (size_t j = 0; j < entry->count && candidate_count < MAX_CANDIDATES_PER_LOOKUP; j++) {
-                    int dist = edit_distance(query, entry->words[j], max_edit_distance_search);
-                    if (dist <= max_edit_distance_search) {
-                        bool found = false;
-                        for (int c = 0; c < candidate_count; c++) {
-                            if (strcmp(candidates[c].term, entry->words[j]) == 0) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            strncpy(candidates[candidate_count].term, entry->words[j], SYMSPELL_MAX_TERM_LENGTH - 1);
-                            candidates[candidate_count].frequency = entry->frequencies[j];
-                            candidates[candidate_count].distance = dist;
-                            candidate_count++;
-                        }
-                    }
+            if (strcmp(dict->table[idx]->delete_str, candidate) != 0) continue;
+
+            delete_entry_t* entry = dict->table[idx];
+            for (size_t si = 0; si < entry->count; si++) {
+                const char* suggestion = entry->words[si];
+                int suggestion_len = (int)strlen(suggestion);
+                if (strcmp(suggestion, query) == 0) continue;
+                if ((abs(suggestion_len - input_len) > max2)
+                    || (suggestion_len < candidate_len)
+                    || (suggestion_len == candidate_len && strcmp(suggestion, candidate) != 0))
+                    continue;
+                int sugg_prefix_len = (suggestion_len < dict->prefix_length) ? suggestion_len : dict->prefix_length;
+                if (sugg_prefix_len > input_prefix_len && (sugg_prefix_len - candidate_len) > max2) continue;
+
+                int distance = 0, min = 0;
+                if (candidate_len == 0) {
+                    distance = (input_len > suggestion_len) ? input_len : suggestion_len;
+                    if (distance > max2 ||
+                        genset_seen_or_add((genset_t*)&dict->cand_seen, xxh3(suggestion,(size_t)suggestion_len), suggestion)) continue;
+                } else if (suggestion_len == 1) {
+                    distance = (strchr(query, suggestion[0]) == NULL) ? input_len : (input_len - 1);
+                    if (distance > max2 ||
+                        genset_seen_or_add((genset_t*)&dict->cand_seen, xxh3(suggestion,(size_t)suggestion_len), suggestion)) continue;
+                } else if (((dict->prefix_length - max_edit_distance == candidate_len)
+                            && (((min = ((input_len < suggestion_len ? input_len : suggestion_len) - dict->prefix_length)) > 1)
+                                && (strcmp(query + (input_len + 1 - min), suggestion + (suggestion_len + 1 - min)) != 0)))
+                           || ((min > 0) && (query[input_len - min] != suggestion[suggestion_len - min])
+                               && ((query[input_len - min - 1] != suggestion[suggestion_len - min])
+                                   || (query[input_len - min] != suggestion[suggestion_len - min - 1])))) {
+                    continue;
+                } else {
+                    if (!delete_in_suggestion_prefix(candidate, candidate_len, suggestion, suggestion_len, dict->prefix_length)
+                        || genset_seen_or_add((genset_t*)&dict->cand_seen, xxh3(suggestion,(size_t)suggestion_len), suggestion)) continue;
+                    distance = damerau_osa(query, input_len, suggestion, suggestion_len, max2);
+                    if (distance > max2) continue;
                 }
-                break;
+
+                if (distance <= max2) {
+                    if (candidate_count > 0 && distance < max2) candidate_count = 0;  /* Closest: drop worse */
+                    max2 = distance;
+                    strncpy(candidates[candidate_count].term, suggestion, SYMSPELL_MAX_TERM_LENGTH - 1);
+                    candidates[candidate_count].term[SYMSPELL_MAX_TERM_LENGTH - 1] = '\0';
+                    candidates[candidate_count].frequency = entry->frequencies[si];
+                    candidates[candidate_count].distance = distance;
+                    candidate_count++;
+                }
+            }
+            break;
+        }
+
+        if ((length_diff < max_edit_distance) && (candidate_len <= dict->prefix_length)) {
+            if (length_diff >= max2) continue;
+            for (int i = 0; i < candidate_len; i++) {
+                if (cand_list_count >= (int)dict->delete_buffer_capacity) break;
+                char* dslot = cand_list[cand_list_count];
+                int k = 0;
+                for (int jj = 0; jj < candidate_len; jj++) if (jj != i) dslot[k++] = candidate[jj];
+                dslot[k] = '\0';
+                if (!genset_seen_or_add((genset_t*)&dict->delete_seen, xxh3(dslot,(size_t)k), dslot))
+                    cand_list_count++;
             }
         }
     }
-    
-    // Cleanup delete buffer
-    for (size_t d = 0; d < delete_count; d++) {
-        free(dict->delete_work_buffer[d]);
-        dict->delete_work_buffer[d] = NULL;
-    }
 
-    if (candidate_count == 0) {
-        pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
-        return 0;
+#ifdef DO_SORT
+    if (candidate_count > 0) {
+        qsort(candidates, candidate_count, sizeof(symspell_suggestion_t), compare_suggestions);
     }
     
-    // Sort all candidates by distance, then frequency
-    qsort(candidates, candidate_count, sizeof(symspell_suggestion_t), compare_suggestions);
-    
-    // Apply verbosity filtering
-    int result_count = 0;
-    
-    switch (verbosity) {
-        case SYMSPELL_VERBOSITY_TOP:
-            // Return only the single best suggestion
-            suggestions[0] = candidates[0];
-            uint64_t best_hash = xxh3(candidates[0].term, strlen(candidates[0].term));
-            suggestions[0].probability = symspell_get_probability(dict, best_hash);
-            suggestions[0].iwf = calculate_iwf(suggestions[0].probability);
-            result_count = 1;
-            break;
-            
-        case SYMSPELL_VERBOSITY_CLOSEST:
-            // Return all suggestions at minimum edit distance
-            {
-                int min_distance = candidates[0].distance;
-                for (int i = 0; i < candidate_count && result_count < max_suggestions; i++) {
-                    if (candidates[i].distance == min_distance) {
-                        suggestions[result_count] = candidates[i];
-                        uint64_t hash = xxh3(candidates[i].term, strlen(candidates[i].term));
-                        suggestions[result_count].probability = symspell_get_probability(dict, hash);
-                        suggestions[result_count].iwf = calculate_iwf(suggestions[result_count].probability);
-                        result_count++;
-                    } else {
-                        break;  // Stop when distance increases
-                    }
-                }
-            }
-            break;
-            
-        case SYMSPELL_VERBOSITY_ALL:
-            // Return all suggestions up to max_suggestions
-            result_count = (candidate_count < max_suggestions) ? candidate_count : max_suggestions;
-            for (int i = 0; i < result_count; i++) {
-                suggestions[i] = candidates[i];
-                uint64_t hash = xxh3(candidates[i].term, strlen(candidates[i].term));
-                suggestions[i].probability = symspell_get_probability(dict, hash);
-                suggestions[i].iwf = calculate_iwf(suggestions[i].probability);
-            }
-            break;
-            
-        default:
-            // Fallback to TOP
-            suggestions[0] = candidates[0];
-            uint64_t hash = xxh3(candidates[0].term, strlen(candidates[0].term));
-            suggestions[0].probability = symspell_get_probability(dict, hash);
-            suggestions[0].iwf = calculate_iwf(suggestions[0].probability);
-            result_count = 1;
-            break;
+    int result_count = (candidate_count < max_suggestions) ? candidate_count : max_suggestions;
+    for (int i = 0; i < result_count; i++) {
+        suggestions[i] = candidates[i];
     }
-    
     pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
     return result_count;
+#else
+    if (candidate_count > 0) {
+        symspell_suggestion_t best_suggestion = candidates[0];
+        for (int i = 1; i < candidate_count; i++) {
+            if (candidates[i].distance < best_suggestion.distance) {
+                best_suggestion = candidates[i];
+            } else if (candidates[i].distance == best_suggestion.distance &&
+                       candidates[i].frequency > best_suggestion.frequency) {
+                best_suggestion = candidates[i];
+            }
+        }
+        
+        uint64_t best_hash = xxh3(best_suggestion.term, strlen(best_suggestion.term));
+        float probability = symspell_get_probability(dict, best_hash);
+        best_suggestion.probability = probability;
+        best_suggestion.iwf = calculate_iwf(probability);
+
+        suggestions[0] = best_suggestion;
+        pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
+        return 1;
+    }
+    pthread_mutex_unlock((pthread_mutex_t*)&dict->lookup_mutex);
+    return 0;
+#endif
 }
+
 /* Get probability for a word hash */
 float symspell_get_probability(const symspell_dict_t* dict, uint64_t word_hash) {
     if (!dict || !dict->exact_table) return 0.0f;
@@ -880,12 +952,11 @@ void symspell_destroy(symspell_dict_t* dict) {
         free(dict->exact_table);
     }
     
-    if (dict->delete_work_buffer) {
-        for (size_t i = 0; i < dict->delete_buffer_capacity; i++) {
-            free(dict->delete_work_buffer[i]);
-        }
-        free(dict->delete_work_buffer);
-    }
+    free(dict->delete_work_buffer);   /* slot array; slots point into delete_pool */
+    free(dict->delete_pool);
+    free(dict->delete_queue);
+    genset_free(&dict->delete_seen);
+    genset_free(&dict->cand_seen);
     free(dict->candidate_buffer);
     
     if (dict->table) {
