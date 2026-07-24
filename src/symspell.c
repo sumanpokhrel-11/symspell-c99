@@ -727,6 +727,15 @@ int symspell_lookup(
     symspell_suggestion_t* suggestions, int max_suggestions
 ) {
     if (!dict || !term || !suggestions || max_suggestions <= 0) return 0;
+    {
+        /* Reject empty/whitespace-only input. Edit distance from a short or empty
+         * string to any word is just that word's length (or close to it), so a
+         * blank query would otherwise "match" every dictionary word up to
+         * max_edit_distance characters long -- meaningless for spell-checking. */
+        const char* p = term;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) return 0;
+    }
 
     pthread_mutex_lock((pthread_mutex_t*)&dict->lookup_mutex);
     
